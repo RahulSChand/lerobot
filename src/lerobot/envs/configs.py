@@ -847,6 +847,9 @@ class RoboTwinEnvConfig(EnvConfig):
     # must equal what SAPIEN actually renders.
     observation_height: int = 240
     observation_width: int = 320
+    # Capture a fresh camera/state observation every N executed actions. Policies
+    # that execute open-loop chunks can set this to their action execution horizon.
+    observation_refresh_interval: int = 1
     # "joint": 14-d joint-space control. "ee": 16-d end-effector-pose deltas executed via CuRobo IK
     # (for world-model policies like LingBot-VA that predict per-arm xyz+quaternion+gripper poses).
     action_mode: str = "joint"
@@ -866,6 +869,8 @@ class RoboTwinEnvConfig(EnvConfig):
     )
 
     def __post_init__(self):
+        if self.observation_refresh_interval < 1:
+            raise ValueError("observation_refresh_interval must be positive")
         if self.action_mode == "ee":
             self.features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(16,))
         cam_list = [c.strip() for c in self.camera_names.split(",") if c.strip()]
@@ -910,6 +915,7 @@ class RoboTwinEnvConfig(EnvConfig):
             observation_height=self.observation_height,
             observation_width=self.observation_width,
             episode_length=self.episode_length,
+            observation_refresh_interval=self.observation_refresh_interval,
             action_mode=self.action_mode,
         )
 

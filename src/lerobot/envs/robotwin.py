@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -288,6 +289,9 @@ def _load_robotwin_setup_kwargs(task_name: str) -> dict[str, Any]:
 
     # Headless overrides
     args["render_freq"] = 0
+    # Match RoboTwin's native evaluation launcher. This loads the task-specific
+    # action limit from task_config/_eval_step_limit.yml during setup_demo().
+    args["eval_mode"] = True
     args["task_name"] = task_name
     args["task_config"] = task_config
 
@@ -356,6 +360,7 @@ class RoboTwinEnv(gym.Env):
         observation_height: int | None = None,
         observation_width: int | None = None,
         episode_length: int = DEFAULT_EPISODE_LENGTH,
+        observation_refresh_interval: int = 1,
         render_mode: str = "rgb_array",
         action_mode: str = "joint",
     ):
@@ -380,10 +385,14 @@ class RoboTwinEnv(gym.Env):
         self.observation_width = observation_width or DEFAULT_CAMERA_W
         self.episode_length = episode_length
         self._max_episode_steps = episode_length  # lerobot_eval.rollout reads this
+        if observation_refresh_interval < 1:
+            raise ValueError("observation_refresh_interval must be positive")
+        self.observation_refresh_interval = observation_refresh_interval
         self.render_mode = render_mode
 
         self._env: Any | None = None  # deferred — created on first reset() inside worker
         self._step_count: int = 0
+        self._last_observation: RobotObservation | None = None
         self._black_frame: np.ndarray = np.zeros(
             (self.observation_height, self.observation_width, 3), dtype=np.uint8
         )
@@ -463,6 +472,7 @@ class RoboTwinEnv(gym.Env):
         return np.asarray(pose, dtype=np.float64)
 
     def reset(self, seed: int | None = None, **kwargs) -> tuple[RobotObservation, dict]:
+        reset_started = time.perf_counter()
         self._ensure_env()
         super().reset(seed=seed)
         assert self._env is not None  # set by _ensure_env() above
@@ -474,6 +484,11 @@ class RoboTwinEnv(gym.Env):
             self._env.setup_demo(**setup_kwargs)
         self.episode_index += self._reset_stride
         self._step_count = 0
+        native_step_limit = getattr(self._env, "step_lim", None)
+        if isinstance(native_step_limit, int) and native_step_limit > 0:
+            self._max_episode_steps = min(self.episode_length, native_step_limit)
+        else:
+            self._max_episode_steps = self.episode_length
 
         use_official_instruction = self.task_name in {"blocks_ranking_rgb", "blocks_ranking_size"}
         if _env_flag(OFFICIAL_INSTRUCTION_ENV, default=use_official_instruction):
@@ -489,7 +504,15 @@ class RoboTwinEnv(gym.Env):
             self._init_eef_pose = self._read_eef_pose()
 
         obs = self._get_obs()
-        return obs, {"is_success": False, "task": self.task_name}
+        self._last_observation = obs
+        reset_seconds = time.perf_counter() - reset_started
+        logger.info(
+            "RoboTwin reset | task=%s | seed=%s | seconds=%.3f",
+            self.task_name,
+            actual_seed,
+            reset_seconds,
+        )
+        return obs, {"is_success": False, "task": self.task_name, "reset_seconds": reset_seconds}
 
     def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
         assert self._env is not None, "step() called before reset()"
@@ -512,10 +535,21 @@ class RoboTwinEnv(gym.Env):
         if not is_success and hasattr(self._env, "check_success"):
             is_success = bool(self._env.check_success())
 
-        obs = self._get_obs()
         reward = float(is_success)
         terminated = is_success
-        truncated = self._step_count >= self.episode_length
+        truncated = self._step_count >= self._max_episode_steps
+        refresh_observation = (
+            terminated
+            or truncated
+            or self._last_observation is None
+            or self._step_count % self.observation_refresh_interval == 0
+        )
+        if refresh_observation:
+            obs = self._get_obs()
+            self._last_observation = obs
+        else:
+            assert self._last_observation is not None
+            obs = self._last_observation
 
         info: dict[str, Any] = {
             "task": self.task_name,
@@ -527,7 +561,6 @@ class RoboTwinEnv(gym.Env):
                 "task": self.task_name,
                 "is_success": is_success,
             }
-            self.reset()
 
         return obs, reward, terminated, truncated, info
 
@@ -560,6 +593,7 @@ def _make_env_fns(
     observation_height: int,
     observation_width: int,
     episode_length: int,
+    observation_refresh_interval: int,
     action_mode: str = "joint",
 ) -> list[Callable[[], RoboTwinEnv]]:
     """Return n_envs factory callables for a single task."""
@@ -573,6 +607,7 @@ def _make_env_fns(
             observation_height=observation_height,
             observation_width=observation_width,
             episode_length=episode_length,
+            observation_refresh_interval=observation_refresh_interval,
             action_mode=action_mode,
         )
 
@@ -587,6 +622,7 @@ def create_robotwin_envs(
     observation_height: int = DEFAULT_CAMERA_H,
     observation_width: int = DEFAULT_CAMERA_W,
     episode_length: int = DEFAULT_EPISODE_LENGTH,
+    observation_refresh_interval: int = 1,
     action_mode: str = "joint",
 ) -> dict[str, dict[int, Any]]:
     """Create vectorized RoboTwin 2.0 environments.
@@ -604,6 +640,7 @@ def create_robotwin_envs(
         observation_height: Pixel height for all cameras.
         observation_width: Pixel width for all cameras.
         episode_length: Max steps before truncation.
+        observation_refresh_interval: Capture observations every N executed actions.
     """
     if env_cls is None or not callable(env_cls):
         raise ValueError("env_cls must be callable (e.g. gym.vector.AsyncVectorEnv).")
@@ -638,6 +675,7 @@ def create_robotwin_envs(
             observation_height=observation_height,
             observation_width=observation_width,
             episode_length=episode_length,
+            observation_refresh_interval=observation_refresh_interval,
             action_mode=action_mode,
         )
         if is_async:

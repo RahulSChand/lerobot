@@ -494,6 +494,7 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds: list[int | None] = []
+    all_episode_lengths: list[int] = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -571,6 +572,7 @@ def eval_policy(
         n_steps = rollout_data["done"].shape[1]
         # Note: this relies on a property of argmax: that it returns the first occurrence as a tiebreaker.
         done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
+        all_episode_lengths.extend((done_indices + 1).tolist())
 
         # Make a mask with shape (batch, n_steps) to mask out rollout data after the first done
         # (batch-element-wise). Note the `done_indices + 1` to make sure to keep the data from the done step.
@@ -680,13 +682,15 @@ def eval_policy(
                 "max_reward": max_reward,
                 "success": success,
                 "seed": seed,
+                "episode_length": episode_length,
             }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
+            for i, (sum_reward, max_reward, success, seed, episode_length) in enumerate(
                 zip(
                     sum_rewards[:n_episodes],
                     max_rewards[:n_episodes],
                     all_successes[:n_episodes],
                     all_seeds[:n_episodes],
+                    all_episode_lengths[:n_episodes],
                     strict=True,
                 )
             )
@@ -820,8 +824,8 @@ def eval_main(cfg: EvalPipelineConfig) -> None:
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
     recording_dir = Path(cfg.output_dir) / "recordings" if cfg.eval.recording else None
-    max_episodes_rendered = 0 if cfg.eval.recording else 10
-    videos_dir = None if cfg.eval.recording else Path(cfg.output_dir) / "videos"
+    max_episodes_rendered = 0 if cfg.eval.recording else cfg.eval.max_episodes_rendered
+    videos_dir = Path(cfg.output_dir) / "videos" if max_episodes_rendered > 0 else None
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
@@ -873,6 +877,7 @@ class TaskMetrics(TypedDict):
     sum_rewards: list[float]
     max_rewards: list[float]
     successes: list[bool]
+    per_episode: list[dict[str, Any]]
     video_paths: list[str]
     predicted_video_paths: list[str]
 
@@ -925,6 +930,7 @@ def eval_one(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
+        per_episode=per_episode,
         video_paths=task_result.get("video_paths", []),
         predicted_video_paths=task_result.get("predicted_video_paths", []),
     )

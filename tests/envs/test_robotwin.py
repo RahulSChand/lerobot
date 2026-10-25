@@ -83,6 +83,7 @@ def _patch_runtime(mock_task_instance: MagicMock):
         "right_robot_file": "",
         "dual_arm_embodied": True,
         "render_freq": 0,
+        "eval_mode": True,
         "task_name": "beat_block_hammer",
         "task_config": "demo_clean",
     }
@@ -142,6 +143,7 @@ class TestRoboTwinEnv:
         call_kwargs = mock_task.setup_demo.call_args.kwargs
         assert call_kwargs["seed"] == 42
         assert call_kwargs["is_test"] is True
+        assert call_kwargs["eval_mode"] is True
 
     def test_step_returns_correct_types(self):
         mock_task = _make_mock_task_env()
@@ -186,6 +188,48 @@ class TestRoboTwinEnv:
             env.step(action)  # step 1
             _, _, _, truncated, _ = env.step(action)  # step 2 → truncated
         assert truncated is True
+
+    def test_native_eval_step_limit_caps_episode_length(self):
+        mock_task = _make_mock_task_env()
+        mock_task.step_lim = 2
+        env = RoboTwinEnv(task_name="beat_block_hammer", episode_length=10)
+        action = np.zeros(ACTION_DIM, dtype=np.float32)
+        with _patch_runtime(mock_task):
+            env.reset()
+            assert env._max_episode_steps == 2
+            env.step(action)
+            _, _, _, truncated, _ = env.step(action)
+        assert truncated is True
+
+    def test_observation_refresh_interval_reuses_observation_within_chunk(self):
+        mock_task = _make_mock_task_env()
+        env = RoboTwinEnv(
+            task_name="beat_block_hammer",
+            episode_length=10,
+            observation_refresh_interval=2,
+        )
+        action = np.zeros(ACTION_DIM, dtype=np.float32)
+        with _patch_runtime(mock_task):
+            env.reset()
+            assert mock_task.get_obs.call_count == 1
+            env.step(action)
+            assert mock_task.get_obs.call_count == 1
+            env.step(action)
+            assert mock_task.get_obs.call_count == 2
+
+    def test_terminal_step_does_not_reset_environment(self):
+        mock_task = _make_mock_task_env()
+        mock_task.step_lim = 1
+        env = RoboTwinEnv(task_name="beat_block_hammer", episode_length=10)
+        action = np.zeros(ACTION_DIM, dtype=np.float32)
+        with _patch_runtime(mock_task):
+            env.reset()
+            assert mock_task.setup_demo.call_count == 1
+            _, _, _, truncated, _ = env.step(action)
+            assert truncated is True
+            assert mock_task.setup_demo.call_count == 1
+            env.reset()
+            assert mock_task.setup_demo.call_count == 2
 
     def test_close_calls_close_env(self):
         mock_task = _make_mock_task_env()
