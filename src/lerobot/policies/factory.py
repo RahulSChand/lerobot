@@ -47,10 +47,11 @@ from .pretrained import PreTrainedPolicy
 from .utils import validate_visual_features_consistency
 
 if TYPE_CHECKING or _peft_available:
-    from peft import PeftConfig, PeftModel
+    from peft import PeftConfig, PeftModel, get_peft_model
 else:
     PeftConfig = None
     PeftModel = None
+    get_peft_model = None
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -247,7 +248,8 @@ def make_policy(
             config resolution, same stats-derived buffers, same device placement and eval mode —
             but skip the safetensors weight load. Used when resuming from a DCP checkpoint, whose
             sharded weights stream in after `accelerator.prepare()` (the distributed checkpoint
-            engine overwrites the random init).
+            engine overwrites the random init). For a PEFT policy only the adapter weights are
+            skipped, the base weights load as usual.
         pretrained_path (str | Path | None): Load the weights (or PEFT adapter) from here instead
             of `cfg.pretrained_path`, which keeps naming the model the policy was fine-tuned from
             once the policy is built. Used when resuming from a checkpoint.
@@ -388,13 +390,17 @@ def make_policy(
 
         kwargs["revision"] = peft_config.revision
         policy = policy_cls.from_pretrained(**kwargs)
-        policy = PeftModel.from_pretrained(
-            policy,
-            peft_pretrained_path,
-            config=peft_config,
-            revision=cfg.pretrained_revision,
-            is_trainable=True,
-        )
+        if defer_weight_load:
+            peft_config.inference_mode = False  # trainable, as `is_trainable=True` below
+            policy = get_peft_model(policy, peft_config)
+        else:
+            policy = PeftModel.from_pretrained(
+                policy,
+                peft_pretrained_path,
+                config=peft_config,
+                revision=cfg.pretrained_revision,
+                is_trainable=True,
+            )
 
     else:
         # Make a fresh policy.
